@@ -38,6 +38,12 @@ class GPTConfig:
     n_kv_head: int = 6
     n_embd: int = 768
     window_pattern: str = "SSSL"
+    # Ablation mechanisms (all zero = standard baseline)
+    n_rrpram: int = 0           # RoPE-RRPRAM routing heads
+    n_rrpram_original: int = 0  # original position-locked RRPRAM heads
+    n_janus: int = 0            # Janus echo heads
+    rrpram_shared_v: bool = True # RRPRAM shares value proj with content
+    use_mech_gate: bool = False  # explicit sigmoid gate blending
 
 
 def norm(x):
@@ -67,30 +73,120 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
-        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
-        self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+
+        # Mechanism head counts
+        self.n_rrpram = config.n_rrpram
+        self.n_rrpram_original = config.n_rrpram_original
+        self.n_janus = config.n_janus
+        self.n_content = config.n_head - self.n_rrpram - self.n_rrpram_original - self.n_janus
+        assert self.n_content >= 1, f"Need at least 1 content head, got {self.n_content}"
+
+        # Content heads
+        self.c_q = nn.Linear(self.n_embd, self.n_content * self.head_dim, bias=False)
+        self.c_k = nn.Linear(self.n_embd, self.n_content * self.head_dim, bias=False)
+        self.c_v = nn.Linear(self.n_embd, self.n_content * self.head_dim, bias=False)
+
+        # RoPE-RRPRAM heads (separate routing Q/K, shared or separate V)
+        if self.n_rrpram > 0:
+            self.r_q = nn.Linear(self.n_embd, self.n_rrpram * self.head_dim, bias=False)
+            self.r_k = nn.Linear(self.n_embd, self.n_rrpram * self.head_dim, bias=False)
+            self.rrpram_shared_v = config.rrpram_shared_v
+            if self.rrpram_shared_v:
+                assert self.n_content >= self.n_rrpram, \
+                    f"shared_v requires n_content ({self.n_content}) >= n_rrpram ({self.n_rrpram})"
+            else:
+                self.r_v = nn.Linear(self.n_embd, self.n_rrpram * self.head_dim, bias=False)
+
+        # Original RRPRAM heads (position-locked routing matrix)
+        if self.n_rrpram_original > 0:
+            self.wr = nn.Parameter(torch.empty(self.n_rrpram_original * self.n_embd, config.sequence_len))
+            self.orig_v = nn.Linear(self.n_embd, self.n_rrpram_original * self.head_dim, bias=False)
+
+        # Janus echo heads (per-token gated projection, no cross-position)
+        if self.n_janus > 0:
+            self.j_w = nn.Linear(self.n_embd, self.n_janus * self.head_dim, bias=False)
+            self.j_v = nn.Linear(self.n_embd, self.n_janus * self.head_dim, bias=False)
+
+        # Output projection (always n_embd -> n_embd)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+
+        # Gate blending
+        self.use_mech_gate = config.use_mech_gate
+        if self.use_mech_gate:
+            n_mechs = (1 if self.n_content > 0 else 0) + (1 if self.n_rrpram > 0 else 0) + \
+                      (1 if self.n_rrpram_original > 0 else 0) + (1 if self.n_janus > 0 else 0)
+            self.mech_gate = nn.Linear(self.n_embd, n_mechs, bias=False)
+
+        # Value embedding gate (content heads only)
         self.ve_gate_channels = 32
-        self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_content, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
     def forward(self, x, ve, cos_sin, window_size):
         B, T, C = x.size()
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+        cos, sin = cos_sin
+        outputs = []
 
-        # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
+        # --- Content heads ---
+        q = self.c_q(x).view(B, T, self.n_content, self.head_dim)
+        k = self.c_k(x).view(B, T, self.n_content, self.head_dim)
+        v = self.c_v(x).view(B, T, self.n_content, self.head_dim)
+
         if ve is not None:
-            ve = ve.view(B, T, self.n_kv_head, self.head_dim)
+            ve = ve.view(B, T, self.n_content, self.head_dim)
             gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
             v = v + gate.unsqueeze(-1) * ve
 
-        cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
+        y_content = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        outputs.append(y_content)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        # --- RoPE-RRPRAM heads ---
+        if self.n_rrpram > 0:
+            rq = self.r_q(x).view(B, T, self.n_rrpram, self.head_dim)
+            rk = self.r_k(x).view(B, T, self.n_rrpram, self.head_dim)
+            rq, rk = apply_rotary_emb(rq, cos, sin), apply_rotary_emb(rk, cos, sin)
+            rq, rk = norm(rq), norm(rk)
+            if self.rrpram_shared_v:
+                # Share content values (take first n_rrpram heads worth from c_v)
+                rv = self.c_v(x).view(B, T, self.n_content, self.head_dim)[:, :, :self.n_rrpram]
+            else:
+                rv = self.r_v(x).view(B, T, self.n_rrpram, self.head_dim)
+            y_rrpram = fa3.flash_attn_func(rq, rk, rv, causal=True, window_size=window_size)
+            outputs.append(y_rrpram)
+
+        # --- Original RRPRAM heads ---
+        if self.n_rrpram_original > 0:
+            wr = self.wr[:, :T].view(self.n_rrpram_original, self.n_embd, T)
+            # scores[b, r, t, p] = x[b, t, :] @ wr[r, :, p]
+            scores = torch.einsum('btc,rcp->brtp', x, wr)
+            # Causal mask: position t can only attend to positions <= t
+            causal_mask = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
+            scores.masked_fill_(causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+            weights = F.softmax(scores, dim=-1)
+            v_orig = self.orig_v(x).view(B, T, self.n_rrpram_original, self.head_dim)
+            # y[b, r, t, d] = sum_p weights[b, r, t, p] * v[b, p, r, d]
+            y_orig = torch.einsum('brtp,bprd->btrd', weights, v_orig)
+            outputs.append(y_orig)
+
+        # --- Janus echo heads ---
+        if self.n_janus > 0:
+            jw = self.j_w(x).view(B, T, self.n_janus, self.head_dim)
+            jv = self.j_v(x).view(B, T, self.n_janus, self.head_dim)
+            y_janus = jv * F.normalize(jw, dim=-1)
+            outputs.append(y_janus)
+
+        # --- Combine ---
+        if self.use_mech_gate and len(outputs) > 1:
+            gates = torch.sigmoid(self.mech_gate(x))  # [B, T, n_mechs]
+            gated = []
+            for i, out in enumerate(outputs):
+                g = gates[..., i:i+1].unsqueeze(-1)  # [B, T, 1, 1]
+                gated.append(out * g)
+            y = torch.cat(gated, dim=2)
+        else:
+            y = torch.cat(outputs, dim=2) if len(outputs) > 1 else outputs[0]
+
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -133,11 +229,12 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
-        # Value embeddings
+        # Value embeddings (sized for content heads only)
         head_dim = config.n_embd // config.n_head
-        kv_dim = config.n_kv_head * head_dim
+        n_content = config.n_head - config.n_rrpram - config.n_rrpram_original - config.n_janus
+        ve_dim = n_content * head_dim
         self.value_embeds = nn.ModuleDict({
-            str(i): nn.Embedding(config.vocab_size, kv_dim)
+            str(i): nn.Embedding(config.vocab_size, ve_dim)
             for i in range(config.n_layer) if has_ve(i, config.n_layer)
         })
         # Rotary embeddings
@@ -155,10 +252,28 @@ class GPT(nn.Module):
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5
         for block in self.transformer.h:
-            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight)
+            attn = block.attn
+            torch.nn.init.uniform_(attn.c_q.weight, -s, s)
+            torch.nn.init.uniform_(attn.c_k.weight, -s, s)
+            torch.nn.init.uniform_(attn.c_v.weight, -s, s)
+            torch.nn.init.zeros_(attn.c_proj.weight)
+            # RoPE-RRPRAM
+            if attn.n_rrpram > 0:
+                torch.nn.init.uniform_(attn.r_q.weight, -s, s)
+                torch.nn.init.uniform_(attn.r_k.weight, -s, s)
+                if not attn.rrpram_shared_v:
+                    torch.nn.init.uniform_(attn.r_v.weight, -s, s)
+            # Original RRPRAM
+            if attn.n_rrpram_original > 0:
+                torch.nn.init.uniform_(attn.wr, -1.0 / n_embd**0.5, 1.0 / n_embd**0.5)
+                torch.nn.init.uniform_(attn.orig_v.weight, -s, s)
+            # Janus echo
+            if attn.n_janus > 0:
+                torch.nn.init.uniform_(attn.j_w.weight, -s, s)
+                torch.nn.init.uniform_(attn.j_v.weight, -s, s)
+            # Mechanism gate bias to zero (equal start)
+            if attn.use_mech_gate:
+                torch.nn.init.zeros_(attn.mech_gate.weight)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
         # Per-layer scalars
@@ -236,14 +351,18 @@ class GPT(nn.Module):
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
                         weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.config.n_embd
-        matrix_params = list(self.transformer.h.parameters())
+        # Separate original RRPRAM routing weights (position-indexed, use AdamW not Muon)
+        wr_params = [block.attn.wr for block in self.transformer.h if hasattr(block.attn, 'wr')]
+        wr_ids = {id(p) for p in wr_params}
+        matrix_params = [p for p in self.transformer.h.parameters() if id(p) not in wr_ids]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
-            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params))
+        assert len(list(self.parameters())) == (len(matrix_params) + len(wr_params) +
+            len(embedding_params) + len(lm_head_params) + len(value_embeds_params) +
+            len(resid_params) + len(x0_params))
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
@@ -254,6 +373,8 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+        if wr_params:
+            param_groups.append(dict(kind='adamw', params=wr_params, lr=matrix_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0))
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(
@@ -450,6 +571,13 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 DEPTH = 8               # number of transformer layers
 DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
+# Ablation mechanisms (all zero = standard baseline)
+N_RRPRAM = 0            # RoPE-RRPRAM routing heads per layer
+N_RRPRAM_ORIGINAL = 0   # original position-locked RRPRAM heads per layer
+N_JANUS = 0             # Janus echo heads per layer
+RRPRAM_SHARED_V = True  # RRPRAM shares value projection with content
+USE_MECH_GATE = False   # explicit sigmoid gate between mechanism types
+
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
 # ---------------------------------------------------------------------------
@@ -474,6 +602,9 @@ def build_model_config(depth):
         sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=WINDOW_PATTERN,
+        n_rrpram=N_RRPRAM, n_rrpram_original=N_RRPRAM_ORIGINAL,
+        n_janus=N_JANUS, rrpram_shared_v=RRPRAM_SHARED_V,
+        use_mech_gate=USE_MECH_GATE,
     )
 
 config = build_model_config(DEPTH)
