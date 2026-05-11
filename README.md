@@ -80,6 +80,68 @@ Seeing as there seems to be a lot of interest in tinkering with autoresearch on 
 
 I think these would be the reasonable hyperparameters to play with. Ask your favorite coding agent for help and copy paste them this guide, as well as the full source code.
 
+## Ablation experiments
+
+`train.py` includes optional attention mechanisms ported from [PostGPT-Q](https://github.com/iamolegataeff/q.git/README.md): RRPRAM (position-locked routing), RoPE-routing heads, Janus Echo (per-token gated projection), and explicit gate blending. All are disabled by default — the baseline is standard multi-head attention.
+
+Ablation hyperparameters are configurable via environment variables. With no env vars set, `train.py` behaves identically to the upstream baseline.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `DEPTH` | 8 | Transformer layers (use 12 for ablations — gives 6 heads) |
+| `SEED` | 42 | RNG seed (vary for multi-seed confirmation) |
+| `N_JANUS` | 0 | Janus echo heads per layer |
+| `N_RRPRAM` | 0 | RoPE-routing heads per layer |
+| `N_RRPRAM_ORIGINAL` | 0 | Original position-locked RRPRAM heads per layer |
+| `RRPRAM_SHARED_V` | 1 | RoPE-routing shares value projection with content (0 = separate) |
+| `USE_MECH_GATE` | 0 | Explicit sigmoid gate between mechanism types |
+| `DEVICE_BATCH_SIZE` | 128 | Per-device batch size (reduce for original RRPRAM memory) |
+
+Example — run Janus with one head at depth 12:
+
+```bash
+DEPTH=12 SEED=42 N_JANUS=1 uv run train.py 2>&1 | tee run-J1.log
+```
+
+See `PLAN-autoresearch-ablations2.md` (in the repo root) for the full experiment plan, run commands for every config, and decision criteria.
+
+### CPU smoke test
+
+`test_ablations_20260509_00_cpu.py` verifies that all ablation code paths train without NaN or crashes. It stubs out Flash Attention 3 with PyTorch SDPA and uses plain Adam instead of Muon, so loss values are not comparable to GPU runs — the test only proves gradients flow.
+
+```bash
+# Requires data to exist (run uv run prepare.py first)
+uv run test_ablations_20260509_00_cpu.py
+```
+
+By default it runs at depth=3, seq=128, batch=4 for 30 seconds per config. Override via env vars:
+
+```bash
+DEPTH=6 SEQ=256 BATCH=2 TIME_LIMIT=60 uv run test_ablations_20260509_00_cpu.py
+```
+
+### GPU ablation sweep
+
+`test_ablations_20260509_01_gpu.py` runs all five mechanism configs as full `uv run train.py` invocations and collects results into a comparison table. Each config gets a 5-minute training run with the real Muon optimizer and Flash Attention.
+
+```bash
+uv run test_ablations_20260509_01_gpu.py
+```
+
+Override depth, seed, or batch size:
+
+```bash
+DEPTH=12 SEED=43 uv run test_ablations_20260509_01_gpu.py
+```
+
+Human-readable summary (with val_bpb, tok/sec, VRAM, etc.) goes to stderr. Machine-readable TSV goes to stdout, so you can capture it:
+
+```bash
+uv run test_ablations_20260509_01_gpu.py | tee -a ablation_results.tsv
+```
+
+Both scripts run the same five configs (baseline, Janus, RoPE-routing shared V, RoPE-routing separate V, original RRPRAM) and report val loss/bpb and tok/sec in their summary tables.
+
 ## Notable forks
 
 - [miolini/autoresearch-macos](https://github.com/miolini/autoresearch-macos) (MacOS)
