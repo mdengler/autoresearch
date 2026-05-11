@@ -178,7 +178,7 @@ class CausalSelfAttention(nn.Module):
 
         # --- Combine ---
         if self.use_mech_gate and len(outputs) > 1:
-            gates = torch.sigmoid(self.mech_gate(x))  # [B, T, n_mechs]
+            gates = 2.0 * torch.sigmoid(self.mech_gate(x))  # [B, T, n_mechs] scale-neutral at init
             gated = []
             for i, out in enumerate(outputs):
                 g = gates[..., i:i+1].unsqueeze(-1)  # [B, T, 1, 1]
