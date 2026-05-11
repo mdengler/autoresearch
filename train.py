@@ -568,23 +568,26 @@ WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
-DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+DEPTH = int(os.environ.get("DEPTH", 8))
+DEVICE_BATCH_SIZE = int(os.environ.get("DEVICE_BATCH_SIZE", 128))
 
 # Ablation mechanisms (all zero = standard baseline)
-N_RRPRAM = 0            # RoPE-RRPRAM routing heads per layer
-N_RRPRAM_ORIGINAL = 0   # original position-locked RRPRAM heads per layer
-N_JANUS = 0             # Janus echo heads per layer
-RRPRAM_SHARED_V = True  # RRPRAM shares value projection with content
-USE_MECH_GATE = False   # explicit sigmoid gate between mechanism types
+N_RRPRAM = int(os.environ.get("N_RRPRAM", 0))
+N_RRPRAM_ORIGINAL = int(os.environ.get("N_RRPRAM_ORIGINAL", 0))
+N_JANUS = int(os.environ.get("N_JANUS", 0))
+RRPRAM_SHARED_V = os.environ.get("RRPRAM_SHARED_V", "1") in ("1", "true", "True")
+USE_MECH_GATE = os.environ.get("USE_MECH_GATE", "0") in ("1", "true", "True")
+
+# Seed (override for multi-seed ablation runs)
+SEED = int(os.environ.get("SEED", 42))
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
 # ---------------------------------------------------------------------------
 
 t_start = time.time()
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed(SEED)
 torch.set_float32_matmul_precision("high")
 device = torch.device("cuda")
 autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -759,3 +762,4 @@ print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
+print(f"seed:             {SEED}")
