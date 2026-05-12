@@ -17,11 +17,36 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
 cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+
+ATTN_BACKEND_REQUESTED = os.environ.get("ATTN_BACKEND", "auto").lower()
+ATTN_BACKEND_ALIASES = {
+    "custom": "custom_sdpa",
+    "custom-sdpa": "custom_sdpa",
+    "sdpa": "custom_sdpa",
+}
+ATTN_BACKEND = ATTN_BACKEND_ALIASES.get(ATTN_BACKEND_REQUESTED, ATTN_BACKEND_REQUESTED)
+if ATTN_BACKEND == "auto":
+    ATTN_BACKEND = "fa3" if cap == (9, 0) else "fa2"
+
+if ATTN_BACKEND == "fa3":
+    from kernels import get_kernel
+    # varunneal's FA3 build is torch.compile-compatible on Hopper.
+    repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
+    flash_attn = get_kernel(repo).flash_attn_interface
+    ATTN_KERNEL_REPO = repo
+elif ATTN_BACKEND == "fa2":
+    from kernels import get_kernel
+    repo = "kernels-community/flash-attn2"
+    flash_attn = get_kernel(repo).flash_attn_interface
+    ATTN_KERNEL_REPO = repo
+elif ATTN_BACKEND == "custom_sdpa":
+    ATTN_KERNEL_REPO = "torch.nn.functional.scaled_dot_product_attention+dense_window_mask"
+else:
+    raise ValueError(
+        "ATTN_BACKEND must be 'auto', 'fa3', 'fa2', or 'custom_sdpa', "
+        f"got {ATTN_BACKEND_REQUESTED!r}"
+    )
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -62,6 +87,32 @@ def apply_rotary_emb(x, cos, sin):
     y1 = x1 * cos + x2 * sin
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3)
+
+
+def _sdpa_window_mask(seq_len, window_size, device):
+    left, right = window_size
+    q_pos = torch.arange(seq_len, device=device)[:, None]
+    k_pos = torch.arange(seq_len, device=device)[None, :]
+    mask = k_pos <= q_pos if right == 0 else k_pos <= q_pos + right
+    if left >= 0:
+        mask = mask & (k_pos >= q_pos - left)
+    return mask
+
+
+def attention_func(q, k, v, causal=True, window_size=(-1, -1)):
+    if ATTN_BACKEND in ("fa2", "fa3"):
+        return flash_attn.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
+
+    q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+    seq_len = q.size(-2)
+    left, right = window_size
+    if not causal and left < 0 and right < 0:
+        y = F.scaled_dot_product_attention(q, k, v)
+        return y.transpose(1, 2)
+    full_causal = causal and right == 0 and (left < 0 or left >= seq_len - 1)
+    attn_mask = None if full_causal else _sdpa_window_mask(seq_len, window_size, q.device)
+    y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=full_causal)
+    return y.transpose(1, 2)
 
 
 class CausalSelfAttention(nn.Module):
@@ -138,7 +189,7 @@ class CausalSelfAttention(nn.Module):
 
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
-        y_content = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        y_content = attention_func(q, k, v, causal=True, window_size=window_size)
         outputs.append(y_content)
 
         # --- RoPE-RRPRAM heads ---
@@ -152,7 +203,7 @@ class CausalSelfAttention(nn.Module):
                 rv = self.c_v(x).view(B, T, self.n_content, self.head_dim)[:, :, :self.n_rrpram]
             else:
                 rv = self.r_v(x).view(B, T, self.n_rrpram, self.head_dim)
-            y_rrpram = fa3.flash_attn_func(rq, rk, rv, causal=True, window_size=window_size)
+            y_rrpram = attention_func(rq, rk, rv, causal=True, window_size=window_size)
             outputs.append(y_rrpram)
 
         # --- Original RRPRAM heads ---
@@ -612,6 +663,11 @@ def build_model_config(depth):
 
 config = build_model_config(DEPTH)
 print(f"Model config: {asdict(config)}")
+print(
+    f"Attention backend: {ATTN_BACKEND} "
+    f"(requested {ATTN_BACKEND_REQUESTED}, kernel {ATTN_KERNEL_REPO}, "
+    f"cuda capability {cap[0]}.{cap[1]})"
+)
 
 with torch.device("meta"):
     model = GPT(config)
@@ -764,3 +820,6 @@ print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
 print(f"seed:             {SEED}")
+print(f"attention_backend: {ATTN_BACKEND}")
+print(f"attention_backend_requested: {ATTN_BACKEND_REQUESTED}")
+print(f"attention_kernel_repo: {ATTN_KERNEL_REPO}")

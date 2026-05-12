@@ -84,7 +84,7 @@ I think these would be the reasonable hyperparameters to play with. Ask your fav
 
 `train.py` includes optional attention mechanisms ported from [PostGPT-Q](https://github.com/iamolegataeff/q.git/README.md): RRPRAM (position-locked routing), RoPE-routing heads, Janus Echo (per-token gated projection), and explicit gate blending. All are disabled by default — the baseline is standard multi-head attention.
 
-Ablation hyperparameters are configurable via environment variables. With no env vars set, `train.py` behaves identically to the upstream baseline.
+Ablation hyperparameters are configurable via environment variables. With no mechanism env vars set, `train.py` keeps the upstream baseline architecture; the attention backend is selected by `ATTN_BACKEND`.
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
@@ -96,6 +96,11 @@ Ablation hyperparameters are configurable via environment variables. With no env
 | `RRPRAM_SHARED_V` | 1 | RoPE-routing shares value projection with content (0 = separate) |
 | `USE_MECH_GATE` | 0 | Explicit sigmoid gate between mechanism types |
 | `DEVICE_BATCH_SIZE` | 128 | Per-device batch size (reduce for original RRPRAM memory) |
+| `ATTN_BACKEND` | auto | `auto`, `fa3`, `fa2`, or `custom_sdpa`; auto uses FA3 on Hopper and FA2 elsewhere |
+
+`custom_sdpa` is the repo-local PyTorch SDPA path with an explicit dense sliding-window mask.
+Treat it as an attention-backend measurement coordinate, not as a silent fallback for mechanism
+ablations. On Spark/aarch64 GB10 builds, `auto` is expected to resolve to FA2.
 
 Example — run Janus with one head at depth 12:
 
@@ -122,7 +127,9 @@ DEPTH=6 SEQ=256 BATCH=2 TIME_LIMIT=60 uv run test_ablations_20260509_00_cpu.py
 
 ### GPU ablation sweep
 
-`test_ablations_20260509_01_gpu.py` runs all five mechanism configs as full `uv run train.py` invocations and collects results into a comparison table. Each config gets a 5-minute training run with the real Muon optimizer and Flash Attention.
+`test_ablations_20260509_01_gpu.py` runs all five mechanism configs as full `uv run train.py` invocations and collects results into a comparison table. Each config gets a 5-minute training run with the real Muon optimizer and the selected attention backend.
+When the selected backend is not already `custom_sdpa`, the sweep also runs one extra baseline with
+`ATTN_BACKEND=custom_sdpa` so backend effects are visible before mechanism results are interpreted.
 
 ```bash
 uv run test_ablations_20260509_01_gpu.py
@@ -140,7 +147,7 @@ Human-readable summary (with val_bpb, tok/sec, VRAM, etc.) goes to stderr. Machi
 uv run test_ablations_20260509_01_gpu.py | tee -a ablation_results.tsv
 ```
 
-Both scripts run the same five configs (baseline, Janus, RoPE-routing shared V, RoPE-routing separate V, original RRPRAM) and report val loss/bpb and tok/sec in their summary tables.
+Both scripts run the same five mechanism configs (baseline, Janus, RoPE-routing shared V, RoPE-routing separate V, original RRPRAM) and report val loss/bpb, backend, and tok/sec in their summary tables.
 
 ## Notable forks
 

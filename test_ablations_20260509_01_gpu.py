@@ -8,20 +8,30 @@ import sys
 DEPTH = int(os.environ.get("DEPTH", 12))
 SEED = int(os.environ.get("SEED", 42))
 DEVICE_BATCH_SIZE = int(os.environ.get("DEVICE_BATCH_SIZE", 128))
+FAILURE_STDERR_LINES = int(os.environ.get("FAILURE_STDERR_LINES", 80))
+DEFAULT_ATTENTION_BACKEND = os.environ.get("ATTN_BACKEND", "auto").lower()
+CUSTOM_ATTENTION_ALIASES = {"custom", "custom-sdpa", "custom_sdpa", "sdpa"}
 
-CONFIGS = [
-    ("baseline",                    {}),
-    ("5c + 1 Janus",                {"N_JANUS": "1"}),
-    ("5c + 1 RoPE-RRPRAM (shared)", {"N_RRPRAM": "1", "RRPRAM_SHARED_V": "1"}),
-    ("5c + 1 RoPE-RRPRAM (sep v)",  {"N_RRPRAM": "1", "RRPRAM_SHARED_V": "0"}),
-    ("5c + 1 orig RRPRAM",          {"N_RRPRAM_ORIGINAL": "1", "DEVICE_BATCH_SIZE": "32"}),
-]
 
 SUMMARY_FIELDS = [
     "val_bpb", "training_seconds", "total_seconds", "peak_vram_mb",
     "mfu_percent", "tok_per_sec", "total_tokens_M", "num_steps",
-    "num_params_M", "depth", "seed",
+    "num_params_M", "depth", "seed", "attention_backend",
+    "attention_backend_requested", "attention_kernel_repo",
 ]
+
+
+def build_configs():
+    configs = [("baseline", {})]
+    if DEFAULT_ATTENTION_BACKEND not in CUSTOM_ATTENTION_ALIASES:
+        configs.append(("backend baseline custom-SDPA", {"ATTN_BACKEND": "custom_sdpa"}))
+    configs.extend([
+        ("5c + 1 Janus",                {"N_JANUS": "1"}),
+        ("5c + 1 RoPE-RRPRAM (shared)", {"N_RRPRAM": "1", "RRPRAM_SHARED_V": "1"}),
+        ("5c + 1 RoPE-RRPRAM (sep v)",  {"N_RRPRAM": "1", "RRPRAM_SHARED_V": "0"}),
+        ("5c + 1 orig RRPRAM",          {"N_RRPRAM_ORIGINAL": "1", "DEVICE_BATCH_SIZE": "32"}),
+    ])
+    return configs
 
 
 def parse_summary(output):
@@ -80,7 +90,7 @@ def run_config(name, extra_env):
     if result.returncode != 0:
         print(f"  EXIT CODE {result.returncode}", file=sys.stderr)
         if result.stderr:
-            for line in result.stderr.splitlines()[-10:]:
+            for line in result.stderr.splitlines()[-FAILURE_STDERR_LINES:]:
                 print(f"  stderr: {line}", file=sys.stderr)
         return False, {}
 
@@ -89,29 +99,35 @@ def run_config(name, extra_env):
         print(f"  WARNING: no summary block found in output", file=sys.stderr)
         return False, {}
 
-    print(f"  val_bpb={metrics.get('val_bpb', '?')}  tok/sec={metrics.get('tok_per_sec', '?')}", file=sys.stderr)
+    print(
+        f"  backend={metrics.get('attention_backend', '?')}"
+        f"  val_bpb={metrics.get('val_bpb', '?')}"
+        f"  tok/sec={metrics.get('tok_per_sec', '?')}",
+        file=sys.stderr,
+    )
     return True, metrics
 
 
 def main():
     results = {}
-    for name, extra_env in CONFIGS:
+    for name, extra_env in build_configs():
         ok, metrics = run_config(name, extra_env)
-        results[name] = (ok, metrics)
+        results[name] = (ok, metrics, extra_env)
 
     # Summary table
     hdr = (
-        f"{'Config':40s}  {'Pass':4s}  {'val_bpb':>8s}  {'tok/sec':>10s}"
+        f"{'Config':40s}  {'Backend':12s}  {'Pass':4s}  {'val_bpb':>8s}  {'tok/sec':>10s}"
         f"  {'tokens_M':>8s}  {'Steps':>5s}  {'VRAM_MB':>8s}  {'Params_M':>8s}"
     )
     print(f"\n{'=' * 60}", file=sys.stderr)
     print("SUMMARY", file=sys.stderr)
     print(hdr, file=sys.stderr)
-    for name, (ok, m) in results.items():
+    for name, (ok, m, _extra_env) in results.items():
         if ok and m:
             tok_sec = int(m.get("tok_per_sec", 0))
             print(
-                f"  {name:38s}  {'PASS':4s}"
+                f"  {name:38s}  {str(m.get('attention_backend', '?')):12s}"
+                f"  {'PASS':4s}"
                 f"  {m.get('val_bpb', 0):8.4f}"
                 f"  {tok_sec:>10,}"
                 f"  {m.get('total_tokens_M', 0):8.1f}"
@@ -121,16 +137,22 @@ def main():
                 file=sys.stderr,
             )
         else:
-            print(f"  {name:38s}  FAIL", file=sys.stderr)
+            print(f"  {name:38s}  {'?':12s}  FAIL", file=sys.stderr)
 
     # Machine-readable TSV to stdout
-    tsv_cols = ["config", "status", "val_bpb", "tok_per_sec", "total_tokens_M",
-                "num_steps", "peak_vram_mb", "num_params_M", "training_seconds", "seed"]
+    tsv_cols = [
+        "config", "status", "attention_backend", "attention_backend_requested",
+        "attention_kernel_repo", "val_bpb", "tok_per_sec", "total_tokens_M",
+        "num_steps", "peak_vram_mb", "num_params_M", "training_seconds", "seed",
+    ]
     print("\t".join(tsv_cols))
-    for name, (ok, m) in results.items():
+    for name, (ok, m, extra_env) in results.items():
         if ok and m:
             row = [
                 name, "pass",
+                str(m.get("attention_backend", "")),
+                str(m.get("attention_backend_requested", "")),
+                str(m.get("attention_kernel_repo", "")),
                 f"{m.get('val_bpb', 0):.6f}",
                 f"{int(m.get('tok_per_sec', 0))}",
                 f"{m.get('total_tokens_M', 0):.1f}",
@@ -141,7 +163,8 @@ def main():
                 f"{int(m.get('seed', 0))}",
             ]
         else:
-            row = [name, "fail"] + [""] * (len(tsv_cols) - 2)
+            requested = extra_env.get("ATTN_BACKEND", os.environ.get("ATTN_BACKEND", "auto"))
+            row = [name, "fail", "", requested, ""] + [""] * (len(tsv_cols) - 5)
         print("\t".join(row))
 
 

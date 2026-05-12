@@ -2,13 +2,14 @@
 import os, sys, time, math
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+os.environ["ATTN_BACKEND"] = "custom_sdpa"
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass, asdict
 
-# ---- Stub out FA3 with PyTorch SDPA ----
+# ---- Stub out external attention kernels with PyTorch SDPA ----
 class _SDPAStub:
     @staticmethod
     def flash_attn_func(q, k, v, causal=True, window_size=None):
@@ -113,6 +114,7 @@ VOCAB = 8192  # match trained tokenizer
 ASPECT_RATIO = 64
 HEAD_DIM = int(os.environ.get("HEAD_DIM", 64))
 TIME_LIMIT = int(os.environ.get("TIME_LIMIT", 30))
+WINDOW_PATTERN = os.environ.get("WINDOW_PATTERN", "L")
 
 def make_cfg(**kw):
     d = DEPTH * ASPECT_RATIO
@@ -120,7 +122,7 @@ def make_cfg(**kw):
     nh = d // HEAD_DIM
     return GPTConfig(
         sequence_len=SEQ, vocab_size=VOCAB, n_layer=DEPTH,
-        n_head=nh, n_kv_head=nh, n_embd=d, window_pattern="L", **kw
+        n_head=nh, n_kv_head=nh, n_embd=d, window_pattern=WINDOW_PATTERN, **kw
     )
 
 def run_config(name, **kw):
